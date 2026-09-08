@@ -503,25 +503,29 @@ COPY_JS = """
 COUNTER_JS = """
 () => {
   const LIMIT = __LIMIT__;
-  const wire = () => {
+  let last = -1;
+  const sync = () => {
     const ta = document.querySelector('#inp textarea');
     const out = document.querySelector('#char-count');
-    if (!ta || !out) return false;
-    if (ta.dataset.counterWired === '1') return true;
+    if (!ta || !out) return;
+    const n = ta.value.length;
+    if (n === last) return;
+    last = n;
+    out.textContent = n.toLocaleString() + ' / ' + LIMIT.toLocaleString() + ' characters';
+    out.style.color = n > LIMIT * 0.9 ? '#d97706' : '';
+  };
+  const wire = () => {
+    const ta = document.querySelector('#inp textarea');
+    if (!ta || ta.dataset.counterWired === '1') return !!ta;
     ta.dataset.counterWired = '1';
-    const upd = () => {
-      const n = ta.value.length;
-      out.textContent = n.toLocaleString() + ' / ' + LIMIT.toLocaleString() + ' characters';
-      out.style.color = n > LIMIT * 0.9 ? '#d97706' : '';
-    };
-    ta.addEventListener('input', upd);
-    upd();
+    ta.addEventListener('input', sync);
     return true;
   };
-  if (!wire()) {
-    let tries = 0;
-    const iv = setInterval(() => { if (wire() || ++tries > 40) clearInterval(iv); }, 250);
-  }
+  wire();
+  sync();
+  // Gradio fills the box programmatically when an example or Clear is used,
+  // which fires no input event, so poll as well as listen.
+  setInterval(() => { wire(); sync(); }, 400);
 }
 """
 
