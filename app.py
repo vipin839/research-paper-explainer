@@ -17,8 +17,13 @@ import threading
 import time
 from datetime import datetime, timezone
 
-import gradio as gr
-from openai import OpenAI
+# Gradio ships usage telemetry that posts to api.gradio.app on startup and on
+# every launch. This app collects nothing about its visitors, so the telemetry
+# is switched off. It MUST be set before gradio is imported to take effect.
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+
+import gradio as gr  # noqa: E402
+from openai import OpenAI  # noqa: E402
 
 # --------------------------------------------------------------------------
 # MODEL CONFIG  --  swap MODEL_ID here to change models.
@@ -89,31 +94,44 @@ That doesn't contain enough scientific content to explain - try pasting a full a
 # different vocabulary ceiling, sentence length and treatment of numbers.
 LEVELS = {
     "Beginner": (
-        "AUDIENCE: a curious 15-year-old with no science education at all.\n"
-        "- Use everyday words only. If a word would not appear in a normal conversation, replace it "
-        "or explain it in the simplest possible terms.\n"
-        "- Keep sentences short and direct.\n"
-        "- Include one concrete everyday analogy to make the main idea land.\n"
-        "- Do not use gene names, statistical notation, p-values or units unless you immediately "
-        "explain what they mean in plain words.\n"
-        "- Never assume the reader knows what a cell, a gene, or a control group is."
+        "AUDIENCE: someone with ZERO scientific background. Assume they have never taken a "
+        "science class. Think of a curious 15-year-old, or an adult reading outside their field.\n"
+        "WHAT TO DO:\n"
+        "- Replace technical vocabulary entirely. Do not define jargon - avoid using it at all. "
+        "Say 'a gene that acts like a brake on cell growth', not 'a tumour suppressor gene'.\n"
+        "- Build the explanation around ONE concrete everyday analogy (a brake, a photocopier "
+        "jamming, a thermostat) and carry it through.\n"
+        "- Convert every number into a plain comparison: '3.2-fold' becomes 'more than three "
+        "times as many'. Drop p-values, confidence intervals and units entirely.\n"
+        "- Never assume the reader knows what a cell, gene, molecule or control group is.\n"
+        "- Short sentences. Nothing a friend could not follow out loud."
     ),
     "Student": (
-        "AUDIENCE: an undergraduate science student who knows general biology, chemistry and physics "
-        "but not this particular subfield.\n"
-        "- Keep the important specialist terms - they need to learn them - but define each one briefly "
-        "in parentheses the first time it appears.\n"
-        "- Keep the key numbers and state plainly what each one means.\n"
-        "- Assume basic vocabulary such as cell, gene, molecule and experiment is already understood.\n"
-        "- Aim for the register of a good textbook, not a news article."
+        "AUDIENCE: an undergraduate science student with general biology, chemistry and physics "
+        "literacy, but no knowledge of this particular subfield.\n"
+        "WHAT TO DO:\n"
+        "- Use the real technical terms - they need to learn them - and define each briefly in "
+        "parentheses the first time it appears.\n"
+        "- CONNECT the finding to concepts a student already knows from a first- or second-year "
+        "course: the cell cycle, the central dogma, enzyme kinetics, statistical significance, "
+        "conservation laws. Explicitly name that link, e.g. 'this is the same checkpoint you meet "
+        "when studying the cell cycle'.\n"
+        "- Keep the key numbers and say plainly what each one means.\n"
+        "- Assume cell, gene, molecule, experiment and control group need no explanation.\n"
+        "- Register of a good textbook, not a news article. No everyday analogies."
     ),
     "Advanced": (
-        "AUDIENCE: a practising researcher from a DIFFERENT field, reading outside their specialism.\n"
-        "- Keep full technical precision, all metrics, effect sizes and statistical values.\n"
-        "- Do not simplify the science; instead unpack subfield-specific shorthand and acronyms.\n"
-        "- Explain WHY the chosen method or design is appropriate, not just what was done.\n"
-        "- Assume graduate-level scientific literacy, including what a p-value and a control are.\n"
-        "- Write densely and precisely. Do not use everyday analogies at this level."
+        "AUDIENCE: a practising researcher reading outside their own specialism.\n"
+        "WHAT TO DO:\n"
+        "- PRESERVE the science completely. Keep every technical term, metric, effect size, "
+        "statistic and caveat exactly as precise as the source. Do NOT substitute simpler words "
+        "for technical ones.\n"
+        "- What you simplify is STRUCTURE, not content: reorganise into a clear logical order, "
+        "break dense multi-clause sentences into shorter ones, and put the main finding first.\n"
+        "- Expand subfield-specific acronyms and shorthand on first use, without dumbing them down.\n"
+        "- State why the design or method is appropriate, and name any limitation the text itself "
+        "acknowledges.\n"
+        "- Absolutely no everyday analogies, and no talking down to the reader."
     ),
 }
 
@@ -354,10 +372,12 @@ def count_visitor(request):
 
 
 def last_updated():
-    """Deploy time, taken from this file's timestamp."""
+    """Deploy time, taken from this file's timestamp. UTC, to the minute."""
     try:
         ts = os.path.getmtime(os.path.abspath(__file__))
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d %B %Y")
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+            "%d %B %Y at %H:%M UTC"
+        )
     except Exception:
         return "September 2026"
 
@@ -437,6 +457,34 @@ footer { display: none !important; }
 #out-head { align-items: center; gap: 10px; }
 #out-head h3 { margin: 0; }
 #copy-btn { min-width: 140px; }
+#about-box {
+  margin-top: 22px; padding: 16px 18px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: 10px;
+  background: var(--background-fill-secondary);
+}
+#about-box .ab-title {
+  font-weight: 600; font-size: 0.95rem; margin-bottom: 12px;
+  color: var(--body-text-color);
+}
+#about-box .ab-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 14px;
+}
+#about-box .ab-grid > div {
+  font-size: 0.83rem; line-height: 1.6;
+  color: var(--body-text-color-subdued);
+}
+#about-box .ab-h {
+  display: block; font-weight: 600; margin-bottom: 3px;
+  color: var(--body-text-color);
+}
+#about-box .ab-foot {
+  margin-top: 13px; padding-top: 11px;
+  border-top: 1px solid var(--border-color-primary);
+  font-size: 0.79rem; line-height: 1.55;
+  color: var(--body-text-color-subdued);
+}
 #about-body { font-size: 0.97rem; line-height: 1.7; }
 #about-body h2 { margin-top: 26px; }
 #about-body table { width: 100%; }
@@ -456,6 +504,38 @@ NO_INVENTION_NOTE = (
     "<p id='no-invent'>Explanation generated only from the text you provided. "
     "No external facts added.</p>"
 )
+
+# Visible on the main tab, not hidden away on a separate page. States plainly
+# what the tool does and what it does not collect.
+ABOUT_BOX = """
+<div id="about-box">
+  <div class="ab-title">About this tool &amp; your data</div>
+  <div class="ab-grid">
+    <div>
+      <span class="ab-h">What it is</span>
+      A free tool that rewrites dense scientific abstracts into plain language at
+      three reading levels, built by a biotechnology student to help other students
+      get past jargon.
+    </div>
+    <div>
+      <span class="ab-h">What it does</span>
+      The text you paste is sent over an encrypted connection to NVIDIA's Nemotron
+      model at build.nvidia.com, and the explanation is returned to your screen.
+      That is the whole process.
+    </div>
+    <div>
+      <span class="ab-h">What it does NOT do</span>
+      No accounts. No sign-in. No passwords. It never asks for personal, financial
+      or contact details. It does not store the text you paste, does not keep your
+      explanations, and runs no analytics, tracking or advertising code.
+    </div>
+  </div>
+  <div class="ab-foot">
+    The only thing recorded is an anonymous count of unique visitors, stored as a
+    one-way hash so no IP address is ever written to disk.
+  </div>
+</div>
+"""
 
 # Gradio 6 removed show_copy_button from Textbox and Markdown, so the copy
 # action is done in the browser. Falls back to execCommand where the async
@@ -783,6 +863,7 @@ with gr.Blocks(title="Research Paper Explainer") as demo:
                 ],
             )
 
+            gr.HTML(ABOUT_BOX)
             gr.HTML(FOOTNOTE)
 
         with gr.Tab("About"):
