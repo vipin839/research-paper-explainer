@@ -324,5 +324,8 @@ if __name__ == "__main__":
         css=CSS,
         share=(not on_spaces) and os.environ.get("GRADIO_SHARE", "").lower() in ("1", "true", "yes"),
         inbrowser=not on_spaces,
-        server_name="0.0.0.0" if on_spaces else "127.0.0.1",
+        # Override with GRADIO_SERVER_NAME=0.0.0.0 when running on a remote
+        # machine (Camber, a VM, a container) and reaching it over the network.
+        server_name=os.environ.get("GRADIO_SERVER_NAME")
+        or ("0.0.0.0" if on_spaces else "127.0.0.1"),
     )
