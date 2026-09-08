@@ -81,4 +81,5 @@ jobs:
         with:
           app-name: 'research-paper-explainer'
           slot-name: 'Production'
+          package: .
           
