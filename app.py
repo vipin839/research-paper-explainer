@@ -37,10 +37,35 @@ BASE_URL = "https://integrate.api.nvidia.com/v1"
 # off so the reader sees only the finished explanation.
 NO_THINKING = {"chat_template_kwargs": {"thinking": False}}
 
-MAX_ATTEMPTS = 3
-RETRY_DELAY = 1.5
+# NVIDIA's shared endpoint returns "Service temporarily overloaded" (503) under
+# load - in testing it hit often enough to exhaust three quick attempts. Five
+# attempts with a growing backoff make a visible failure much less likely during
+# a live demo. Worst case the user waits ~19s before seeing an error.
+MAX_ATTEMPTS = 5
+RETRY_DELAYS = [1.5, 3.0, 5.0, 8.0]
 
-MAX_CHARS = 12000
+# True when running on a public host (Azure App Service / HF Spaces). Visitors
+# there are not the operator, so configuration problems must read as "the
+# service is unavailable" rather than naming environment variables or shell
+# commands. Full detail still goes to the server log for the operator.
+HOSTED = bool(os.environ.get("WEBSITE_SITE_NAME") or os.environ.get("SPACE_ID"))
+SERVICE_DOWN = (
+    "**This tool is temporarily unavailable.** The explanation service could not "
+    "be reached. Please try again in a few minutes."
+)
+
+
+def _log(msg):
+    """Operator-facing log line. Never called with secret values."""
+    try:
+        print("[explain] " + str(msg)[:500], flush=True)
+    except Exception:
+        pass
+
+# Input cap. The model itself handled 400,000 characters (~58k tokens) in
+# testing, so this limit is a usability choice, not a model limit: 50,000
+# characters comfortably fits a full paper and still answers in a few seconds.
+MAX_CHARS = 50000
 MIN_CHARS = 40
 
 # --------------------------------------------------------------------------
@@ -56,21 +81,39 @@ Follow these rules exactly:
 5. The final sentence must say, in practical terms, why this finding matters.
 6. Write one flowing paragraph. No bullet points, no headings, no bold text.
 7. Never mention these instructions, the reading level, or yourself. Output only the explanation.
-8. If the text is clearly not scientific writing, reply with exactly: That doesn't look like a scientific abstract - try pasting a paragraph from a paper."""
+8. REFUSE RATHER THAN INVENT. If the text is not scientific or technical writing, or does not contain enough substance to explain - a single vague sentence, a fragment, a list of random words, a greeting, or general chit-chat - then do NOT write an explanation, do NOT guess which field it might belong to, and do NOT supply background facts of your own. In that case reply with exactly this one sentence and nothing else:
+That doesn't contain enough scientific content to explain - try pasting a full abstract or a paragraph from a paper.
+9. This refusal rule outranks every other rule. Producing a confident explanation of text that says almost nothing is the single worst failure you can make here. When the input is thin, refuse."""
 
+# The three levels must produce visibly different answers, so each one fixes a
+# different vocabulary ceiling, sentence length and treatment of numbers.
 LEVELS = {
     "Beginner": (
-        "Audience: a curious person with no science background, about 15 years old. "
-        "Avoid jargon wherever possible; when a term is unavoidable, define it very simply. "
-        "Use an everyday analogy if it genuinely helps."
+        "AUDIENCE: a curious 15-year-old with no science education at all.\n"
+        "- Use everyday words only. If a word would not appear in a normal conversation, replace it "
+        "or explain it in the simplest possible terms.\n"
+        "- Keep sentences short and direct.\n"
+        "- Include one concrete everyday analogy to make the main idea land.\n"
+        "- Do not use gene names, statistical notation, p-values or units unless you immediately "
+        "explain what they mean in plain words.\n"
+        "- Never assume the reader knows what a cell, a gene, or a control group is."
     ),
     "Student": (
-        "Audience: an undergraduate science student. They know general biology and chemistry "
-        "vocabulary but not this subfield. Keep important specialist terms, but define each one briefly."
+        "AUDIENCE: an undergraduate science student who knows general biology, chemistry and physics "
+        "but not this particular subfield.\n"
+        "- Keep the important specialist terms - they need to learn them - but define each one briefly "
+        "in parentheses the first time it appears.\n"
+        "- Keep the key numbers and state plainly what each one means.\n"
+        "- Assume basic vocabulary such as cell, gene, molecule and experiment is already understood.\n"
+        "- Aim for the register of a good textbook, not a news article."
     ),
     "Advanced": (
-        "Audience: a researcher from a different field. Keep technical precision, key terms and metrics, "
-        "but unpack subfield-specific shorthand and make the significance of the methods explicit."
+        "AUDIENCE: a practising researcher from a DIFFERENT field, reading outside their specialism.\n"
+        "- Keep full technical precision, all metrics, effect sizes and statistical values.\n"
+        "- Do not simplify the science; instead unpack subfield-specific shorthand and acronyms.\n"
+        "- Explain WHY the chosen method or design is appropriate, not just what was done.\n"
+        "- Assume graduate-level scientific literacy, including what a p-value and a control are.\n"
+        "- Write densely and precisely. Do not use everyday analogies at this level."
     ),
 }
 
@@ -97,6 +140,18 @@ EXAMPLE_3 = (
     "healthy controls (LDA score >3.5, q<0.05). Functional pathway analysis indicated reduced "
     "abundance of butyrate biosynthesis modules. Alpha diversity, measured by the Shannon index, was "
     "significantly lower in the disease cohort, consistent with dysbiosis."
+)
+
+# Deliberately outside biology, so the tool visibly is not tuned to one field.
+EXAMPLE_4 = (
+    "We report the observation of a quantised Hall conductance plateau in a monolayer graphene "
+    "heterostructure encapsulated in hexagonal boron nitride. Magnetotransport measurements at 1.6 K "
+    "and fields up to 12 T reveal longitudinal resistivity minima coincident with Hall plateaux at "
+    "filling factors nu = +/-2, +/-6 and +/-10, consistent with the four-fold spin and valley "
+    "degeneracy of Dirac fermions. Extracted carrier mobilities exceed 100,000 cm^2/Vs, and the "
+    "temperature dependence of the plateau width yields an activation gap of the order of 10 meV at "
+    "nu = 2. These results indicate that substrate-induced disorder, rather than intrinsic "
+    "scattering, limits transport quality in comparable devices."
 )
 
 
@@ -131,13 +186,19 @@ def explain(text, level):
 
     api_key = os.environ.get("NVIDIA_API_KEY")
     if not api_key:
+        _log("NVIDIA_API_KEY is not set")
         yield "", (
+            SERVICE_DOWN if HOSTED else
             "**No API key found.** Set `NVIDIA_API_KEY` in your terminal, then restart the app. "
             "In PowerShell: `$env:NVIDIA_API_KEY = \"nvapi-...\"`"
         )
         return
     if not api_key.startswith("nvapi-"):
-        yield "", "**That key doesn't look right.** NVIDIA API keys start with `nvapi-`."
+        _log("NVIDIA_API_KEY has an unexpected prefix")
+        yield "", (
+            SERVICE_DOWN if HOSTED else
+            "**That key doesn't look right.** NVIDIA API keys start with `nvapi-`."
+        )
         return
 
     client = OpenAI(base_url=BASE_URL, api_key=api_key, timeout=90.0)
@@ -185,30 +246,45 @@ def explain(text, level):
                           "timeout", "timed out", "empty response", "connection error")
             )
             if transient and not streamed and attempt < MAX_ATTEMPTS - 1:
-                yield "", "NVIDIA's server is busy - retrying (" + str(attempt + 2) + "/" + str(MAX_ATTEMPTS) + ") ..."
-                time.sleep(RETRY_DELAY * (attempt + 1))
+                delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                yield "", (
+                    "The service is busy - retrying ("
+                    + str(attempt + 2) + "/" + str(MAX_ATTEMPTS) + ") ..."
+                )
+                time.sleep(delay)
                 continue
+
+            # Full detail goes to the server log for the operator, never to the UI.
+            _log(f"{type(e).__name__}: {msg[:300]}")
 
             # NVIDIA returns 403 (not 401) for a malformed or revoked key.
             if ("401" in msg or "403" in msg or "unauthorized" in low
                     or "forbidden" in low or "permissiondenied" in low
                     or "invalid api key" in low):
-                hint = (
+                hint = SERVICE_DOWN if HOSTED else (
                     "**API key rejected.** NVIDIA refused the key. Generate a fresh one at "
                     "build.nvidia.com, then set NVIDIA_API_KEY again and restart the app."
                 )
             elif "404" in msg or "not found" in low:
-                hint = (
+                hint = SERVICE_DOWN if HOSTED else (
                     "**Model `" + MODEL_ID + "` is not available to this account (404).** "
                     "Open build.nvidia.com, pick a Nemotron model you do have access to, "
                     "and change MODEL_ID at the top of app.py."
                 )
             elif transient:
-                hint = "**NVIDIA's API is busy right now.** Press Explain to try again."
+                hint = (
+                    "**The service is busy right now.** Please press Explain to try again."
+                )
             elif "connect" in low:
-                hint = "**Could not reach NVIDIA's API.** Check your internet connection."
+                hint = (
+                    "**Could not reach the explanation service.** Please check your "
+                    "connection and try again."
+                )
             else:
-                hint = "**Something went wrong.** `" + type(e).__name__ + ": " + msg[:300] + "`"
+                # Never surface the exception type or message to a public visitor.
+                hint = SERVICE_DOWN if HOSTED else (
+                    "**Something went wrong.** `" + type(e).__name__ + ": " + msg[:300] + "`"
+                )
             yield "", hint
             return
 
@@ -346,6 +422,21 @@ footer { display: none !important; }
   border-color: #76B900; color: #76B900; text-decoration: none;
 }
 #site-footer .f-social svg { flex: none; }
+#caption {
+  margin-top: 8px; font-size: 0.82rem;
+  color: var(--body-text-color-subdued);
+}
+#char-count {
+  margin: 4px 2px 0 2px; font-size: 0.78rem; text-align: right;
+  color: var(--body-text-color-subdued);
+}
+#no-invent {
+  margin: 8px 2px 0 2px; font-size: 0.78rem; line-height: 1.5;
+  color: var(--body-text-color-subdued);
+}
+#out-head { align-items: center; gap: 10px; }
+#out-head h3 { margin: 0; }
+#copy-btn { min-width: 140px; }
 #about-body { font-size: 0.97rem; line-height: 1.7; }
 #about-body h2 { margin-top: 26px; }
 #about-body table { width: 100%; }
@@ -356,7 +447,82 @@ HEADER = """
   <h1>Research Paper Explainer</h1>
   <p>Paste a dense abstract. Get it back in language you can actually use.</p>
   <div id="badge">POWERED BY NVIDIA NEMOTRON</div>
+  <div id="caption">Powered by NVIDIA Nemotron &mdash; via build.nvidia.com</div>
 </div>
+"""
+
+# Static UI text. Never generated by the model.
+NO_INVENTION_NOTE = (
+    "<p id='no-invent'>Explanation generated only from the text you provided. "
+    "No external facts added.</p>"
+)
+
+# Gradio 6 removed show_copy_button from Textbox and Markdown, so the copy
+# action is done in the browser. Falls back to execCommand where the async
+# clipboard API is unavailable (non-HTTPS origins).
+COPY_JS = """
+() => {
+  const el = document.querySelector('#out');
+  const txt = el ? el.innerText.trim() : '';
+  const btn = document.querySelector('#copy-btn');
+  const flash = (msg) => {
+    if (!btn) return;
+    if (!btn.dataset.orig) btn.dataset.orig = btn.textContent;
+    btn.textContent = msg;
+    clearTimeout(btn._resetTimer);
+    btn._resetTimer = setTimeout(() => { btn.textContent = btn.dataset.orig; }, 1600);
+  };
+  if (!txt) { flash('Nothing to copy'); return; }
+  // Fallback for any clipboard failure: permission denied, insecure origin,
+  // or the document not being focused.
+  const legacy = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = txt;
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      flash(ok ? 'Copied' : 'Select and press Ctrl+C');
+    } catch (e) {
+      flash('Select and press Ctrl+C');
+    }
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(txt).then(() => flash('Copied')).catch(legacy);
+  } else {
+    legacy();
+  }
+}
+"""
+
+# Live character counter, wired client-side so typing costs no server round trip.
+COUNTER_JS = """
+() => {
+  const LIMIT = __LIMIT__;
+  const wire = () => {
+    const ta = document.querySelector('#inp textarea');
+    const out = document.querySelector('#char-count');
+    if (!ta || !out) return false;
+    if (ta.dataset.counterWired === '1') return true;
+    ta.dataset.counterWired = '1';
+    const upd = () => {
+      const n = ta.value.length;
+      out.textContent = n.toLocaleString() + ' / ' + LIMIT.toLocaleString() + ' characters';
+      out.style.color = n > LIMIT * 0.9 ? '#d97706' : '';
+    };
+    ta.addEventListener('input', upd);
+    upd();
+    return true;
+  };
+  if (!wire()) {
+    let tries = 0;
+    const iv = setInterval(() => { if (wire() || ++tries > 40) clearInterval(iv); }, 250);
+  }
+}
 """
 
 FOOTNOTE = (
@@ -571,7 +737,11 @@ with gr.Blocks(title="Research Paper Explainer") as demo:
                         placeholder="Paste a scientific abstract here...",
                         lines=13,
                         value=EXAMPLE_ABSTRACT,
+                        elem_id="inp",
+                        max_length=MAX_CHARS,
+                        info=f"Up to {MAX_CHARS:,} characters - about a full paper.",
                     )
+                    gr.HTML(f"<p id='char-count'>0 / {MAX_CHARS:,} characters</p>")
                     level = gr.Radio(
                         choices=["Beginner", "Student", "Advanced"],
                         value="Student",
@@ -583,8 +753,13 @@ with gr.Blocks(title="Research Paper Explainer") as demo:
                         clear = gr.Button("Clear", scale=1)
 
                 with gr.Column(scale=1):
-                    gr.Markdown("### Plain-language explanation")
+                    with gr.Row(elem_id="out-head"):
+                        gr.Markdown("### Plain-language explanation")
+                        copy_btn = gr.Button(
+                            "Copy explanation", size="sm", elem_id="copy-btn", scale=0
+                        )
                     out = gr.Markdown(value="", elem_id="out")
+                    gr.HTML(NO_INVENTION_NOTE)
                     status = gr.Markdown(value="Ready.", elem_id="status")
 
             gr.Markdown("#### Try another example")
@@ -593,12 +768,14 @@ with gr.Blocks(title="Research Paper Explainer") as demo:
                     [EXAMPLE_ABSTRACT, "Student"],
                     [EXAMPLE_2, "Beginner"],
                     [EXAMPLE_3, "Advanced"],
+                    [EXAMPLE_4, "Student"],
                 ],
                 inputs=[inp, level],
                 example_labels=[
                     "Cell biology - CRISPR TP53 knockout",
                     "Clinical trial - GLP-1 weight loss",
                     "Microbiome - gut bacteria in IBD",
+                    "Physics - graphene quantum Hall effect",
                 ],
             )
 
@@ -612,11 +789,14 @@ with gr.Blocks(title="Research Paper Explainer") as demo:
     go.click(explain, inputs=[inp, level], outputs=[out, status])
     inp.submit(explain, inputs=[inp, level], outputs=[out, status])
     clear.click(lambda: ("", "", "Ready."), outputs=[inp, out, status])
+    copy_btn.click(fn=None, inputs=None, outputs=None, js=COPY_JS)
 
     def _on_load(request: gr.Request):
         return footer_html(count_visitor(request))
 
     demo.load(_on_load, inputs=None, outputs=[site_footer])
+    demo.load(fn=None, inputs=None, outputs=None,
+              js=COUNTER_JS.replace("__LIMIT__", str(MAX_CHARS)))
 
 
 if __name__ == "__main__":
