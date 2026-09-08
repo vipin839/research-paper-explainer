@@ -277,3 +277,49 @@ Force light mode (better on video): <http://127.0.0.1:7860/?__theme=light>
 
 Naming these accurately is a strength, not a weakness. It shows you understand what
 you built.
+
+---
+
+## 9. The visitor counter and privacy
+
+The footer shows a count of unique visitors. Two things matter about how it works.
+
+**Raw IP addresses are never stored.** Each visitor's IP is combined with a fixed
+salt and hashed with SHA-256; only the first 16 characters of that hash go to disk.
+The count is exact, but the file contains no personal data and the original IPs
+cannot be recovered from it.
+
+**Finding the real IP takes care behind a proxy.** On Azure the app never sees the
+visitor directly - requests arrive through Azure's front end, so `request.client.host`
+is Azure's own address, identical for everybody. The real client IP is in the
+`X-Forwarded-For` header, first entry in the list. Azure also appends a source port
+(`1.2.3.4:51234`), which changes on every request, so the port is stripped before
+hashing. Without that step the same person would be counted dozens of times.
+
+Storage location is chosen per host:
+
+| Host | Path | Why |
+|---|---|---|
+| Azure App Service | `/home/data/visitors.json` | `/home` survives restarts and redeploys |
+| Local | `visitors.json` beside `app.py` | Gitignored |
+
+Writes are guarded by a `threading.Lock`, since Gradio serves requests concurrently.
+Every file operation is wrapped in `try/except` - a counter that cannot be read or
+written must never take the app down with it.
+
+The count updates through `demo.load()`, which Gradio calls on each page load and
+which receives a `gr.Request` carrying the headers.
+
+---
+
+## 10. The About tab
+
+The interface is split into two tabs. **Explain** is the tool; **About** holds the
+documentation a visitor or judge would want: the problem, the pipeline diagram, how
+the NVIDIA model is used, the tech stack table, usage instructions, and an honest
+limitations section.
+
+Gradio renders tab contents lazily - the About panel does not exist in the DOM until
+the tab is first clicked. That is normal, not a bug.
+
+The footer sits outside both tabs, so it is visible everywhere.
