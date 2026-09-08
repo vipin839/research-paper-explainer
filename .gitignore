@@ -6,3 +6,4 @@ __pycache__/
 key.txt
 .gradio/
 azure_test.log
+visitors.json

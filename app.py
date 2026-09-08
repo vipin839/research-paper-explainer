@@ -8,9 +8,15 @@ Built for students who hit a wall of jargon before they hit the actual finding.
 Inference-only: no training, no fine-tuning.
 """
 
+import hashlib
+import json
 import os
 import re
+import tempfile
+import threading
 import time
+from datetime import datetime, timezone
+
 import gradio as gr
 from openai import OpenAI
 
@@ -208,6 +214,79 @@ def explain(text, level):
 
 
 # --------------------------------------------------------------------------
+# VISITOR COUNTER
+# --------------------------------------------------------------------------
+# Counts unique visitors. Raw IP addresses are NEVER written to disk - each IP
+# is salted and hashed, and only the hash is stored. That gives uniqueness
+# without keeping personal data.
+_VISITOR_LOCK = threading.Lock()
+_VISITOR_SALT = "research-paper-explainer-v1"
+
+
+def _visitor_file():
+    """Azure App Service keeps /home across restarts and redeploys."""
+    if os.environ.get("WEBSITE_SITE_NAME"):
+        base = "/home/data"
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        base = tempfile.gettempdir()
+    return os.path.join(base, "visitors.json")
+
+
+def _client_ip(request):
+    """Real client IP. Behind Azure's proxy it arrives in X-Forwarded-For."""
+    if request is None:
+        return None
+    ip = ""
+    try:
+        ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    except Exception:
+        pass
+    if not ip:
+        ip = getattr(getattr(request, "client", None), "host", "") or ""
+    # Azure appends :port to IPv4 entries; IPv6 is left alone.
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d+$", ip):
+        ip = ip.rsplit(":", 1)[0]
+    return ip or None
+
+
+def count_visitor(request):
+    """Record this visitor if new, and return the unique total."""
+    path = _visitor_file()
+    with _VISITOR_LOCK:
+        seen = set()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                seen = set(json.load(f).get("hashes", []))
+        except Exception:
+            pass
+
+        ip = _client_ip(request)
+        if ip:
+            digest = hashlib.sha256((_VISITOR_SALT + ip).encode()).hexdigest()[:16]
+            if digest not in seen:
+                seen.add(digest)
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump({"total": len(seen), "hashes": sorted(seen)}, f)
+                except Exception:
+                    pass
+        return len(seen)
+
+
+def last_updated():
+    """Deploy time, taken from this file's timestamp."""
+    try:
+        ts = os.path.getmtime(os.path.abspath(__file__))
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d %B %Y")
+    except Exception:
+        return "September 2026"
+
+
+# --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
 # NOTE: colours use Gradio's own CSS variables rather than fixed hex values.
@@ -236,6 +315,24 @@ CSS = """
 #out p { color: var(--body-text-color); }
 #status { color: var(--body-text-color-subdued); font-size: 0.86rem; min-height: 20px; }
 footer { display: none !important; }
+
+#site-footer {
+  margin-top: 26px; padding-top: 16px;
+  border-top: 1px solid var(--border-color-primary);
+  text-align: center; line-height: 1.85;
+  color: var(--body-text-color-subdued);
+}
+#site-footer .f-stats { font-size: 0.86rem; }
+#site-footer .f-credits { font-size: 0.8rem; margin-top: 7px; }
+#site-footer .f-copy {
+  font-size: 0.76rem; margin-top: 7px; opacity: 0.8;
+}
+#site-footer .f-dot { margin: 0 7px; opacity: 0.5; }
+#site-footer a { color: #76B900; text-decoration: none; }
+#site-footer a:hover { text-decoration: underline; }
+#about-body { font-size: 0.97rem; line-height: 1.7; }
+#about-body h2 { margin-top: 26px; }
+#about-body table { width: 100%; }
 """
 
 HEADER = """
@@ -247,58 +344,222 @@ HEADER = """
 """
 
 FOOTNOTE = (
-    "<p style='text-align:center;color:#9ca3af;font-size:0.8rem;margin-top:16px'>"
+    "<p style='text-align:center;color:var(--body-text-color-subdued);"
+    "font-size:0.8rem;margin-top:16px'>"
     "Inference-only. The model is instructed to use only the text you paste - "
     "always check the explanation against the original paper.</p>"
 )
+
+GITHUB_URL = "https://github.com/vipin839/research-paper-explainer"
+CONTACT_EMAIL = "sainivipin839@gmail.com"
+
+
+def footer_html(visitors):
+    """Site footer: last updated, unique visitors, contact, credits."""
+    return f"""
+<div id="site-footer">
+  <div class="f-stats">
+    <span><strong>Last updated:</strong> {last_updated()}</span>
+    <span class="f-dot">&middot;</span>
+    <span><strong>Unique visitors:</strong> {visitors:,}</span>
+    <span class="f-dot">&middot;</span>
+    <span><strong>Contact:</strong>
+      <a href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a></span>
+  </div>
+  <div class="f-credits">
+    Model inference by <strong>NVIDIA Nemotron</strong> via the
+    <a href="https://build.nvidia.com" target="_blank" rel="noopener">NVIDIA hosted API</a>
+    &middot; Interface built with <a href="https://gradio.app" target="_blank" rel="noopener">Gradio</a>
+    &middot; Deployed on <strong>Microsoft Azure App Service</strong>
+    &middot; Source on <a href="{GITHUB_URL}" target="_blank" rel="noopener">GitHub</a>
+    &middot; Developed with <strong>Claude Code</strong> (Anthropic)
+  </div>
+  <div class="f-copy">
+    Built by Vipin Saini &middot; Biotechnology &amp; Bioinformatics &middot;
+    For the NVIDIA GTC Golden Ticket Developer Contest
+  </div>
+</div>
+"""
+
+
+ABOUT_MD = f"""
+## About this tool
+
+**Research Paper Explainer** turns a dense scientific abstract into a plain-language
+explanation pitched at the reading level you choose. It was built by a biotechnology
+and bioinformatics student for the problem students actually have: not understanding
+the science, but decoding the vocabulary wrapped around it.
+
+Paste an abstract, pick **Beginner**, **Student** or **Advanced**, and the tool
+rewrites it — defining every unavoidable technical term inline, in parentheses, as it
+goes. You learn the vocabulary instead of skipping past it.
+
+---
+
+## How it works
+
+```
+You paste an abstract  ->  the app builds a system prompt
+                           (8 rules + your chosen audience)
+                                    |
+                                    v
+                        openai Python client over HTTPS
+                                    |
+                                    v
+                      NVIDIA hosted inference endpoint
+                     nvidia/nemotron-3-super-120b-a12b
+                                    |
+                                    v
+                    tokens stream back and fill the page live
+```
+
+Everything runs **inference-only**. No model is trained, fine-tuned, or downloaded.
+The app is a thin, carefully-designed layer between a text box and a large language
+model — the heavy computation happens on NVIDIA's hardware, not on this server.
+
+---
+
+## The NVIDIA model
+
+This tool runs on **`nvidia/nemotron-3-super-120b-a12b`**, part of NVIDIA's
+openly-published **Nemotron** family, accessed through NVIDIA's hosted API at
+`integrate.api.nvidia.com`.
+
+Two things about that endpoint shaped the build:
+
+**It is OpenAI-API-compatible.** NVIDIA implements the same request and response
+shape as the OpenAI API, so the standard `openai` Python package works by pointing it
+at a different `base_url`. No custom HTTP code, and swapping providers later is a
+one-line change.
+
+**Nemotron 3 is a reasoning model.** By default it writes out a private train of
+thought before answering — and that reasoning appears in the reply, so users would
+read *"Okay, the user has given me a scientific statement..."* instead of their
+explanation. The app disables it with
+`extra_body={{"chat_template_kwargs": {{"thinking": false}}}}`, which was found by
+testing rather than from documentation.
+
+The model choice itself came from testing every Nemotron the account could reach.
+This one answered in about two seconds with clean output; a smaller variant degraded
+into repeated characters once reasoning was disabled.
+
+---
+
+## Tech stack
+
+| Layer | Choice | Why |
+|---|---|---|
+| Model | `nvidia/nemotron-3-super-120b-a12b` | Fastest clean responder tested (~2s to first token) |
+| Inference | NVIDIA hosted API | No local GPU needed; genuinely inference-only |
+| Client | `openai` Python package | The endpoint is OpenAI-compatible, so no custom HTTP |
+| Interface | Gradio | Python-only UI with native streaming support |
+| Hosting | Azure App Service (Linux, B1) | Runs a persistent process, which streaming requires |
+| CI/CD | GitHub Actions | Every push to `main` redeploys automatically |
+| Built with | Claude Code (Anthropic) | Pair-programmed, tested and debugged |
+
+---
+
+## How to use it
+
+1. **Paste** a scientific abstract into the box on the Explain tab
+2. **Choose a reading level**
+   - **Beginner** — no science background; jargon avoided, analogies allowed
+   - **Student** — undergraduate; knows general biology, not this subfield
+   - **Advanced** — a researcher from a different field; precision kept, shorthand unpacked
+3. **Press Explain** and watch the explanation stream in
+4. Or click one of the three built-in examples to try it instantly
+
+Each explanation is 4–6 sentences and always ends with one sentence on why the
+finding matters practically.
+
+---
+
+## Accuracy and limits
+
+The prompt is written explicitly against fabrication: the model is instructed to use
+**only** the text you paste and never introduce outside facts. That is the real risk
+when an AI explains research, and it received more attention than the interface did.
+
+Even so, be aware:
+
+- Fabrication is **reduced by the prompt, not eliminated**. Always check against the
+  original paper.
+- The 4–6 sentence rule is an *instruction*, not a hard constraint.
+- Input is capped at 12,000 characters.
+- NVIDIA's endpoint is rate-limited and occasionally busy; the app retries transient
+  failures automatically.
+- It reads pasted text only — no PDF upload, no figures, no references.
+
+---
+
+## Links
+
+- **Source code:** [{GITHUB_URL}]({GITHUB_URL})
+- **Contact:** [{CONTACT_EMAIL}](mailto:{CONTACT_EMAIL})
+- **NVIDIA model catalogue:** [build.nvidia.com](https://build.nvidia.com)
+
+Built for the **NVIDIA GTC Golden Ticket Developer Contest**.
+"""
 
 with gr.Blocks(title="Research Paper Explainer") as demo:
 
     gr.HTML(HEADER)
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            inp = gr.Textbox(
-                label="Abstract or paragraph",
-                placeholder="Paste a scientific abstract here...",
-                lines=13,
-                value=EXAMPLE_ABSTRACT,
-            )
-            level = gr.Radio(
-                choices=["Beginner", "Student", "Advanced"],
-                value="Student",
-                label="Reading level",
-                info="Who is this explanation for?",
-            )
+    with gr.Tabs():
+        with gr.Tab("Explain"):
             with gr.Row():
-                go = gr.Button("Explain", variant="primary", scale=3)
-                clear = gr.Button("Clear", scale=1)
+                with gr.Column(scale=1):
+                    inp = gr.Textbox(
+                        label="Abstract or paragraph",
+                        placeholder="Paste a scientific abstract here...",
+                        lines=13,
+                        value=EXAMPLE_ABSTRACT,
+                    )
+                    level = gr.Radio(
+                        choices=["Beginner", "Student", "Advanced"],
+                        value="Student",
+                        label="Reading level",
+                        info="Who is this explanation for?",
+                    )
+                    with gr.Row():
+                        go = gr.Button("Explain", variant="primary", scale=3)
+                        clear = gr.Button("Clear", scale=1)
 
-        with gr.Column(scale=1):
-            gr.Markdown("### Plain-language explanation")
-            out = gr.Markdown(value="", elem_id="out")
-            status = gr.Markdown(value="Ready.", elem_id="status")
+                with gr.Column(scale=1):
+                    gr.Markdown("### Plain-language explanation")
+                    out = gr.Markdown(value="", elem_id="out")
+                    status = gr.Markdown(value="Ready.", elem_id="status")
 
-    gr.Markdown("#### Try another example")
-    gr.Examples(
-        examples=[
-            [EXAMPLE_ABSTRACT, "Student"],
-            [EXAMPLE_2, "Beginner"],
-            [EXAMPLE_3, "Advanced"],
-        ],
-        inputs=[inp, level],
-        example_labels=[
-            "Cell biology - CRISPR TP53 knockout",
-            "Clinical trial - GLP-1 weight loss",
-            "Microbiome - gut bacteria in IBD",
-        ],
-    )
+            gr.Markdown("#### Try another example")
+            gr.Examples(
+                examples=[
+                    [EXAMPLE_ABSTRACT, "Student"],
+                    [EXAMPLE_2, "Beginner"],
+                    [EXAMPLE_3, "Advanced"],
+                ],
+                inputs=[inp, level],
+                example_labels=[
+                    "Cell biology - CRISPR TP53 knockout",
+                    "Clinical trial - GLP-1 weight loss",
+                    "Microbiome - gut bacteria in IBD",
+                ],
+            )
 
-    gr.HTML(FOOTNOTE)
+            gr.HTML(FOOTNOTE)
+
+        with gr.Tab("About"):
+            gr.Markdown(ABOUT_MD, elem_id="about-body")
+
+    site_footer = gr.HTML(footer_html(0))
 
     go.click(explain, inputs=[inp, level], outputs=[out, status])
     inp.submit(explain, inputs=[inp, level], outputs=[out, status])
     clear.click(lambda: ("", "", "Ready."), outputs=[inp, out, status])
+
+    def _on_load(request: gr.Request):
+        return footer_html(count_visitor(request))
+
+    demo.load(_on_load, inputs=None, outputs=[site_footer])
 
 
 if __name__ == "__main__":
