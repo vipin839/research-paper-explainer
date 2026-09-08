@@ -5,3 +5,4 @@ __pycache__/
 .env
 key.txt
 .gradio/
+azure_test.log

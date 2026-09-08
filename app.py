@@ -302,30 +302,45 @@ with gr.Blocks(title="Research Paper Explainer") as demo:
 
 
 if __name__ == "__main__":
-    # Hugging Face Spaces sets SPACE_ID. On a headless server there is no browser
-    # to open and no need for a share tunnel, so both are disabled there.
+    # Detect managed hosts by the environment variables they set:
+    #   Hugging Face Spaces -> SPACE_ID
+    #   Azure App Service   -> WEBSITE_SITE_NAME
+    # On any of them there is no browser to open, no share tunnel needed, and
+    # the server must bind 0.0.0.0 so the platform's proxy can reach it.
     on_spaces = bool(os.environ.get("SPACE_ID"))
+    on_azure = bool(os.environ.get("WEBSITE_SITE_NAME"))
+    hosted = on_spaces or on_azure
+
+    # Azure App Service injects the port to listen on as PORT.
+    port = os.environ.get("PORT") or os.environ.get("GRADIO_SERVER_PORT")
+    try:
+        port = int(port) if port else None
+    except ValueError:
+        port = None
+
+    host = os.environ.get("GRADIO_SERVER_NAME") or ("0.0.0.0" if hosted else "127.0.0.1")
 
     if not os.environ.get("NVIDIA_API_KEY"):
         print("")
         print("  WARNING: NVIDIA_API_KEY is not set. The UI will load but calls will fail.")
         if on_spaces:
             print("  On Spaces: add it under Settings -> Variables and secrets.")
+        elif on_azure:
+            print("  On Azure: add it under Settings -> Environment variables.")
         else:
             print('  PowerShell:  $env:NVIDIA_API_KEY = "nvapi-..."')
         print("")
     else:
         print("")
         print("  API key detected. Model: " + MODEL_ID)
+        print("  Binding " + host + ":" + str(port or 7860))
         print("")
 
     demo.queue().launch(
         theme=gr.themes.Soft(primary_hue="green", neutral_hue="slate"),
         css=CSS,
-        share=(not on_spaces) and os.environ.get("GRADIO_SHARE", "").lower() in ("1", "true", "yes"),
-        inbrowser=not on_spaces,
-        # Override with GRADIO_SERVER_NAME=0.0.0.0 when running on a remote
-        # machine (Camber, a VM, a container) and reaching it over the network.
-        server_name=os.environ.get("GRADIO_SERVER_NAME")
-        or ("0.0.0.0" if on_spaces else "127.0.0.1"),
+        share=(not hosted) and os.environ.get("GRADIO_SHARE", "").lower() in ("1", "true", "yes"),
+        inbrowser=not hosted,
+        server_name=host,
+        server_port=port,
     )
