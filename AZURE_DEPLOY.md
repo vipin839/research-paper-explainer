@@ -1,0 +1,251 @@
+# Deploying to Azure App Service — from scratch
+
+Complete walkthrough. Follow in order. Roughly 25 minutes, most of it waiting for
+the first build.
+
+**Target:** a permanent public URL like `https://research-paper-explainer.azurewebsites.net`
+
+---
+
+## Phase 0 — What you need
+
+- [ ] A GitHub account
+- [ ] Your Azure Student subscription (already active)
+- [ ] Your NVIDIA API key (`nvapi-...`)
+
+The code is already prepared. `app.py` detects Azure automatically and binds to the
+port Azure gives it — you do not need to change any code.
+
+---
+
+## Phase 1 — Put the code on GitHub
+
+Azure deploys *from* GitHub, so the code has to live there first.
+
+### 1.1 Create an empty repository
+
+Go to <https://github.com/new>
+
+| Field | Value |
+|---|---|
+| Repository name | `research-paper-explainer` |
+| Visibility | **Public** (or Private — both work) |
+| Initialize with README | **Leave unchecked** |
+
+Leave it empty. Your local repo already has the files and history.
+
+Click **Create repository**.
+
+### 1.2 Push your code
+
+In your terminal, from the project folder:
+
+```powershell
+cd "F:\Claude Folder\gtc-paper-explainer"
+git remote add origin https://github.com/YOUR-USERNAME/research-paper-explainer.git
+git push -u origin main
+```
+
+Replace `YOUR-USERNAME` with your actual GitHub username.
+
+If it asks you to sign in, a browser window will open — approve it.
+
+**Check:** refresh the GitHub page. You should see 7 files: `app.py`, `README.md`,
+`DOCUMENTATION.md`, `requirements.txt`, `run.ps1`, `startup.sh`, `.gitignore`.
+
+Your API key is **not** among them — this was verified before pushing.
+
+---
+
+## Phase 2 — Create the Azure Web App
+
+Go to <https://portal.azure.com>
+
+### 2.1 Start the wizard
+
+Search **App Services** in the top bar → **+ Create** → **Web App**
+
+### 2.2 Basics tab
+
+| Field | Value |
+|---|---|
+| Subscription | Azure for Students |
+| Resource Group | **Create new** → `rg-paper-explainer` |
+| Name | `research-paper-explainer` (must be globally unique — add digits if taken) |
+| Publish | **Code** |
+| Runtime stack | **Python 3.12** |
+| Operating System | **Linux** |
+| Region | Pick the one nearest you |
+
+The **Name** becomes your URL: `https://<name>.azurewebsites.net`
+
+### 2.3 Pricing plan
+
+Click **Create new** under App Service Plan, name it `plan-paper-explainer`, then
+under **Pricing plan** choose:
+
+**→ Basic B1** (about $13/month, drawn from your student credit)
+
+Why not the Free F1 tier: it has no *Always On*, so the app sleeps after 20 idle
+minutes and the next visitor waits 30–60 seconds for a cold start. For a contest
+link people will click once, that reads as broken. B1 for a couple of months costs
+roughly $26 of your $100 credit.
+
+### 2.4 Create
+
+Skip the remaining tabs. Click **Review + create** → **Create**.
+
+Wait for "Your deployment is complete" (1–2 minutes), then click
+**Go to resource**.
+
+---
+
+## Phase 3 — Configuration (the part that matters)
+
+Four settings. Miss any one and the app will not work. All are inside your new Web
+App in the left-hand menu.
+
+### 3.1 Environment variables
+
+**Settings → Environment variables → App settings tab**
+
+Click **+ Add** twice:
+
+| Name | Value |
+|---|---|
+| `NVIDIA_API_KEY` | your `nvapi-...` key |
+| `SCM_DO_BUILD_DURING_DEPLOYMENT` | `true` |
+
+- The first is how the app authenticates to NVIDIA.
+- The second tells Azure to install `requirements.txt`. Without it you get
+  `ModuleNotFoundError: No module named 'gradio'`.
+
+Click **Apply**.
+
+### 3.2 Startup Command
+
+**Settings → Configuration → General settings**
+
+Find **Startup Command** and enter exactly:
+
+```
+python app.py
+```
+
+Without this, Azure assumes a gunicorn/Flask app and your app never starts.
+
+### 3.3 Web sockets → On
+
+Same **General settings** page. This keeps the live streaming smooth.
+
+### 3.4 Always On → On
+
+Same page. Stops the app sleeping when idle.
+
+Click **Save** at the top. The app restarts — this is expected.
+
+---
+
+## Phase 4 — Connect GitHub
+
+**Deployment → Deployment Center**
+
+| Field | Value |
+|---|---|
+| Source | **GitHub** |
+| Organization | your GitHub username |
+| Repository | `research-paper-explainer` |
+| Branch | `main` |
+| Authentication type | User-assigned identity (default is fine) |
+
+Authorize Azure to access GitHub if prompted.
+
+Click **Save**.
+
+This adds a GitHub Actions workflow to your repo and starts the first build.
+
+---
+
+## Phase 5 — Wait, then verify
+
+The first build takes **5–10 minutes** (installing gradio, pandas, numpy).
+
+Watch progress in **Deployment Center → Logs**, or on GitHub under the **Actions**
+tab of your repo.
+
+When it shows success, open:
+
+```
+https://YOUR-APP-NAME.azurewebsites.net
+```
+
+**First load may take 30 seconds.** That is the container starting, and it only
+happens once.
+
+### Test it properly
+
+1. The page loads with the CRISPR abstract pre-filled
+2. Click **Explain**
+3. Text appears in the right-hand panel within a few seconds
+4. Status line reads `Done - Student level, generated by nvidia/nemotron-3-super-120b-a12b`
+
+If all four happen, you are live.
+
+---
+
+## Phase 6 — If something breaks
+
+Always check **Monitoring → Log stream** first. It shows the real Python error.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| "Application Error" page | App did not start | Check Startup Command is `python app.py` (3.2) |
+| `ModuleNotFoundError: gradio` | Dependencies not installed | Add `SCM_DO_BUILD_DURING_DEPLOYMENT=true` (3.1), then Restart |
+| Page loads, "No API key found" | Key missing | Add `NVIDIA_API_KEY` (3.1), then Restart |
+| "API key rejected" | Key wrong or expired | Generate a fresh one at build.nvidia.com |
+| Build fails on a package version | Version conflict with Python 3.12 | Edit `requirements.txt` to `gradio>=6.0` and `openai>=3.0`, commit, push |
+| Explanation appears all at once | Azure buffering the stream | Cosmetic only. Confirm Web sockets is On (3.3) |
+| Very slow first visit | Cold start | Confirm Always On is On (3.4) |
+
+After changing any setting, use **Overview → Restart**.
+
+---
+
+## Phase 7 — Updating the app later
+
+Azure redeploys automatically on every push:
+
+```powershell
+git add -A
+git commit -m "your message"
+git push
+```
+
+Wait 3–5 minutes, then refresh your URL.
+
+---
+
+## Phase 8 — Managing your credit
+
+Your student credit is $100 over 12 months. B1 is roughly $13/month, so leaving it
+running all year would exhaust it.
+
+**Recommended:** keep it running through the contest and judging, then either
+- **Stop** the app (Overview → Stop) — keeps the URL, stops billing, or
+- **Delete the resource group** `rg-paper-explainer` — removes everything
+
+Check spending at **Cost Management + Billing** any time.
+
+To stop billing entirely but keep the code, deleting the resource group is cleanest —
+your GitHub repo keeps everything, and you can redeploy in 15 minutes.
+
+---
+
+## What you end up with
+
+- **GitHub repo** — the code, public, something to link on a CV
+- **Azure URL** — permanent live demo for your LinkedIn post
+- **Local copy** — still runs with `.\run.ps1`, best for recording the video
+
+Record the demo video **locally**. Local streaming is smooth and has no cold start
+or proxy buffering. Use the Azure URL as the clickable link in your post.
