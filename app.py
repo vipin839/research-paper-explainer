@@ -8,6 +8,7 @@ Built for students who hit a wall of jargon before they hit the actual finding.
 Inference-only: no training, no fine-tuning.
 """
 
+import difflib
 import hashlib
 import json
 import os
@@ -35,6 +36,11 @@ from openai import OpenAI  # noqa: E402
 # Not recommended: nvidia/nemotron-3.5-lightning-30b-a3b (degrades badly
 # when reasoning is disabled).
 MODEL_ID = "nvidia/nemotron-3-super-120b-a12b"
+# Tried in order if the primary model keeps failing. All verified working.
+FALLBACK_MODELS = [
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "mistralai/mistral-nemotron",
+]
 BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 # Nemotron 3 is a reasoning model. Left on, it streams its private thinking
@@ -68,9 +74,13 @@ def _log(msg):
         pass
 
 # Input cap. The model itself handled 400,000 characters (~58k tokens) in
-# testing, so this limit is a usability choice, not a model limit: 50,000
-# characters comfortably fits a full paper and still answers in a few seconds.
-MAX_CHARS = 50000
+# testing, so this is a product decision rather than a model limit. This tool
+# explains ABSTRACTS: a long structured abstract runs to roughly 2,000
+# characters, so 5,000 leaves generous headroom while keeping responses near
+# two seconds. Larger inputs still worked, but took 5-8 seconds and produced
+# the same length of answer, since the reply is capped at 4-6 sentences either
+# way - so accepting them cost time without improving the result.
+MAX_CHARS = 5000
 MIN_CHARS = 40
 
 # --------------------------------------------------------------------------
@@ -81,6 +91,7 @@ BASE_RULES = """You are a science communicator who helps students understand den
 Follow these rules exactly:
 1. Explain ONLY what is present in the text the user gives you. Never add facts, numbers, mechanisms, or conclusions that are not in that text. If the text is vague about something, stay vague.
 2. Write in plain, direct language. Prefer short sentences.
+2a. NEVER copy sentences or long phrases from the source text word for word. Every sentence you write must be your own rewording. If your answer could be mistaken for the original abstract, you have failed the task. Rewriting is the entire point - reproducing the source helps nobody.
 3. Any technical term you cannot avoid must be defined immediately in parentheses right after it. Example: "in vitro (in a dish, outside a living body)".
 4. Your explanation must be 4 to 6 sentences. Not fewer, not more.
 5. The final sentence must say, in practical terms, why this finding matters.
@@ -173,13 +184,31 @@ EXAMPLE_4 = (
 )
 
 
-def build_messages(text, level):
+def build_messages(text, level, retry_note=""):
+    """Instruction comes AFTER the source text.
+
+    With the instruction first, the model would sometimes treat the abstract as
+    something to continue rather than to rewrite, and echo it back verbatim.
+    Putting the task last makes it the most recent thing in context.
+    """
     system = BASE_RULES + "\n\n" + LEVELS.get(level, LEVELS["Student"])
     user = (
-        "Explain the following text for the specified audience, following every rule.\n\n"
-        "--- TEXT START ---\n" + text.strip() + "\n--- TEXT END ---"
+        "--- TEXT START ---\n" + text.strip() + "\n--- TEXT END ---\n\n"
+        "Now write your explanation of the text above, for the specified audience, "
+        "following every rule. Put it entirely in your own words - do not repeat or "
+        "lightly edit the sentences above. Output only the explanation."
+        + retry_note
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def longest_verbatim_run(out, src):
+    """Longest stretch of characters the answer shares with the source."""
+    if not out or not src:
+        return 0
+    a, b = src.lower(), out.lower()
+    match = difflib.SequenceMatcher(None, a, b).find_longest_match(0, len(a), 0, len(b))
+    return match.size
 
 
 def scrub(s):
@@ -199,7 +228,11 @@ def explain(text, level):
         yield "", "That's very short. Paste at least a couple of sentences."
         return
     if len(text) > MAX_CHARS:
-        yield "", "That's " + format(len(text), ",") + " characters. Please trim it to under " + format(MAX_CHARS, ",") + "."
+        yield "", (
+            "That's " + format(len(text), ",") + " characters - this tool explains "
+            "**abstracts**, not whole papers. Paste just the abstract, up to "
+            + format(MAX_CHARS, ",") + " characters."
+        )
         return
 
     api_key = os.environ.get("NVIDIA_API_KEY")
@@ -220,14 +253,21 @@ def explain(text, level):
         return
 
     client = OpenAI(base_url=BASE_URL, api_key=api_key, timeout=90.0)
-    busy = "Generating with `" + MODEL_ID + "` ..."
 
-    for attempt in range(MAX_ATTEMPTS):
+    # Attempt plan: try the primary model a few times, then fall back to other
+    # verified models. NVIDIA's endpoint has been observed returning 404 for a
+    # model that is definitely in the catalogue, so a single 404 must not be
+    # treated as fatal - and if the primary really is unavailable, a fallback
+    # keeps the app working rather than showing an error.
+    plan = [MODEL_ID] * 3 + FALLBACK_MODELS
+
+    for attempt, model_id in enumerate(plan):
         streamed = False
+        busy = "Generating with `" + model_id + "` ..."
         try:
             yield "", busy
             stream = client.chat.completions.create(
-                model=MODEL_ID,
+                model=model_id,
                 messages=build_messages(text, level),
                 temperature=0.3,
                 top_p=0.95,
@@ -249,7 +289,16 @@ def explain(text, level):
             if not buf.strip():
                 raise RuntimeError("empty response")
 
-            yield scrub(buf).strip(), "Done - " + level + " level, generated by `" + MODEL_ID + "`."
+            answer = scrub(buf).strip()
+
+            # Observability only, no user-facing change. A long verbatim run
+            # means the model echoed the source instead of rewriting it - the
+            # failure that moving the instruction after the text fixed.
+            run = longest_verbatim_run(answer, text)
+            if run > 150:
+                _log(f"WARNING: answer shares a {run}-char verbatim run with the input")
+
+            yield answer, "Done - " + level + " level, generated by `" + model_id + "`."
             return
 
         except Exception as e:
@@ -261,13 +310,14 @@ def explain(text, level):
             transient = any(
                 k in low
                 for k in ("overload", "429", "rate limit", "502", "503", "504",
-                          "timeout", "timed out", "empty response", "connection error")
+                          "timeout", "timed out", "empty response", "connection error",
+                          "404", "not found")
             )
-            if transient and not streamed and attempt < MAX_ATTEMPTS - 1:
+            if transient and not streamed and attempt < len(plan) - 1:
                 delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
                 yield "", (
                     "The service is busy - retrying ("
-                    + str(attempt + 2) + "/" + str(MAX_ATTEMPTS) + ") ..."
+                    + str(attempt + 2) + "/" + str(len(plan)) + ") ..."
                 )
                 time.sleep(delay)
                 continue
@@ -402,11 +452,16 @@ CSS = """
   letter-spacing: 0.04em;
 }
 #out {
+  /* Fixed band: tall enough for a typical 4-6 sentence answer, capped so a
+     long one scrolls inside the box instead of stretching the whole page. */
   min-height: 240px;
+  max-height: 420px;
+  overflow-y: auto;
   background: var(--background-fill-secondary);
   color: var(--body-text-color);
   border: 1px solid var(--border-color-primary);
   border-radius: 10px; padding: 18px 20px; font-size: 1.05rem; line-height: 1.72;
+  scrollbar-width: thin;
 }
 #out p { color: var(--body-text-color); }
 #status { color: var(--body-text-color-subdued); font-size: 0.86rem; min-height: 20px; }
@@ -823,7 +878,7 @@ with gr.Blocks(title="Research Paper Explainer") as demo:
                         value=EXAMPLE_ABSTRACT,
                         elem_id="inp",
                         max_length=MAX_CHARS,
-                        info=f"Up to {MAX_CHARS:,} characters - about a full paper.",
+                        info=f"Paste one abstract - up to {MAX_CHARS:,} characters.",
                     )
                     gr.HTML(f"<p id='char-count'>0 / {MAX_CHARS:,} characters</p>")
                     level = gr.Radio(

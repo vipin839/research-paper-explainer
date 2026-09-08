@@ -18,7 +18,7 @@ questioning. Read top to bottom; it follows the path a request actually takes.
 | Why does the `openai` package work? | NVIDIA's endpoint is OpenAI-API-compatible |
 | UI framework | Gradio 6.26 |
 | Hosting | Azure App Service (Linux, B1), auto-deploys from GitHub |
-| Input limit | 50,000 characters |
+| Input limit | 5,000 characters (this tool explains abstracts, not whole papers) |
 | Data collected | None. Only an anonymous hashed unique-visitor count |
 
 ---
@@ -147,9 +147,8 @@ The API does not publish a context length, so it was tested directly:
 | 200,000 chars | OK — 29,055 tokens, 10.7s |
 | 400,000 chars | OK — 58,088 tokens, 3.3s |
 
-The model was never the constraint. The app's **50,000-character limit is a
-usability choice** — it comfortably fits a full paper and still answers in a few
-seconds. Longer inputs work but get slow, and a 4–6 sentence summary of an entire
+The model was never the constraint. The app's **5,000-character limit is a
+product decision** — it comfortably fits a long abstract and keeps answers near two seconds. Longer inputs work but get slow, and a 4–6 sentence summary of an entire
 paper is not very useful.
 
 ---
@@ -171,6 +170,7 @@ Nine numbered rules, each preventing a specific failure:
 | 5. Last sentence = why it matters | A summary with no "so what" |
 | 6. One paragraph, no bullets | Output that looks like a slide |
 | 7. Never mention the instructions | The model narrating its own task |
+| 2a. Never copy the source verbatim | Echoing the abstract back instead of rewriting |
 | 8. **Refuse rather than invent** | Confabulating science from thin input |
 | 9. Rule 8 outranks everything else | The model explaining anyway |
 
@@ -268,6 +268,46 @@ cannot help.
 appearing and the connection then drops, it does **not** retry — restarting would
 print the explanation twice. It only retries a request that produced nothing.
 
+### 6.3a Intermittent 404s and the fallback chain
+
+NVIDIA's endpoint has been observed returning **404 for a model that is
+definitely in the catalogue** - in one measurement, 8 of 10 calls failed this
+way while `models.list()` still listed the model. It is an infrastructure
+hiccup, not a missing model.
+
+This matters because a 404 is normally a *permanent* error, so the original
+code failed instantly without retrying. Two changes fixed it:
+
+1. **404 is now treated as retryable**, alongside 429/503/timeouts.
+2. **A fallback chain**: the app tries the primary model three times, then
+   falls back to `nemotron-3-ultra-550b-a55b`, then `mistral-nemotron`.
+
+```python
+plan = [MODEL_ID] * 3 + FALLBACK_MODELS
+```
+
+Measured after the fix: **6 of 6 requests succeeded**, all on the primary model,
+with the retries absorbing the 404s invisibly. Before the fix the same
+conditions produced roughly an 80% failure rate.
+
+The status line names whichever model actually answered, so if a fallback is
+ever used you can see it.
+
+### 6.3b The verbatim-copy bug
+
+On the physics abstract, the model would sometimes **echo the input back word
+for word** instead of explaining it - a 700-character verbatim run, in 3 of 4
+runs. Adding a prompt rule against copying did not help.
+
+The fix was structural: move the instruction **after** the source text in the
+user message. With the instruction first, the model treated the abstract as
+something to continue; with it last, the task is the most recent thing in
+context. Result: 0 of 5 runs copied, verbatim overlap down from 700 characters
+to 11.
+
+`longest_verbatim_run()` still runs on every answer and logs a warning if the
+overlap exceeds 150 characters, so a regression would be visible in the logs.
+
 ### 6.4 Error handling — different messages for you and for visitors
 
 ```python
@@ -298,7 +338,7 @@ Found by testing with a fake key.
 |---|---|
 | Empty | "Paste an abstract above, then press Explain." |
 | Under 40 characters | "That's very short. Paste at least a couple of sentences." |
-| Over 50,000 characters | Tells you the count and the limit |
+| Over 5,000 characters | Tells you the count and asks for just the abstract |
 | Non-English, emoji, code, special characters | Handled — no crash, no traceback |
 
 Tested with Hindi text, code snippets, `<script>` tags, shell metacharacters and
@@ -332,7 +372,7 @@ non-HTTPS origins or when the document is not focused. It flashes "Copied",
 
 ### 6.8 The character counter
 
-Shows `n / 50,000 characters`, turning amber past 90%. The textbox also carries
+Shows `n / 5,000 characters`, turning amber past 90%. The textbox also carries
 `max_length`, so the browser enforces the cap before anything is sent.
 
 **A bug worth remembering:** Gradio sets the textarea value *programmatically*
@@ -488,7 +528,7 @@ Naming these accurately is a strength. It shows you understand what you built.
 - **Fabrication is reduced by the prompt, not eliminated.** Refusal is reliable on
   obvious nonsense; a plausible-sounding but fake abstract would still be explained.
   Always check against the original paper.
-- **Input is capped at 50,000 characters.**
+- **Input is capped at 5,000 characters** - a long structured abstract is about 2,000, so this leaves headroom while keeping answers near two seconds.
 - **NVIDIA's endpoint can be busy.** Five retries make failure unlikely, not impossible.
 - **Text only** — no PDF upload, no figures, no references, no equations as images.
 - **English-oriented.** Other languages do not crash it, but quality is untested.
