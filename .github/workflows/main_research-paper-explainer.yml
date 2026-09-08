@@ -10,6 +10,14 @@ on:
       - main
   workflow_dispatch:
 
+
+# Only one deployment may run at a time. Overlapping runs make Azure's
+# OneDeploy return 409 Conflict, because a deployment lock is already held.
+# Queue them instead of cancelling, so no push is silently skipped.
+concurrency:
+  group: azure-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
